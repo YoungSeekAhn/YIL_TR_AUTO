@@ -5,7 +5,16 @@ import pandas as pd
 import schedule
 from dotenv import find_dotenv, load_dotenv
 
+import os, sys, time, threading, requests
+from datetime import datetime, timezone, timedelta
+
 from datetime import time as dtime
+from pathlib import Path
+
+from auto_tr_functions import last_trading_day
+from TRConfig import config
+from auto_tr_info import AlertManager, LogManager, KISClient
+from auto_tr_gui import TraderGUIUltra, SharedState
 
 # 거래시간
 MARKET_START = dtime(9, 0)
@@ -152,13 +161,6 @@ def pre_market_stage():
     if not all([appkey, appsecret, account]):
         print("[ERROR] .env 인증값 누락"); return
 
-    # 외부 모듈 (날짜/경로)
-    try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-        from DSConfig_3 import config
-        from makedata.dataset_functions import last_trading_day
-    except Exception:
-        print("[ERROR] 프로젝트 모듈(DSConfig_3, makedata) 임포트 실패"); return
 
     # CSV 로드 + confidence 필터
     config.end_date = last_trading_day()
@@ -246,8 +248,9 @@ def _global_log_queue():
 # ──────────────────────────────────────────────────────────────
 def main():
     schedule.clear()
-    schedule.every().day.at("08:50").do(pre_market_stage)
+    # schedule.every().day.at("08:50").do(pre_market_stage)
     print("[SYSTEM] ULTRA GUI 버전 시작 (매일 08:50 자동 실행)")
+    pre_market_stage()  # 일단 즉시 실행해봄
     while True:
         schedule.run_pending()
         time.sleep(1)
