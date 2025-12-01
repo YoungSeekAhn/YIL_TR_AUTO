@@ -21,7 +21,7 @@ from typing import List, Dict, Any, Optional
 
 import pandas as pd
 
-from kis_functions import KISAPI
+from kis_functions_old import KISAPI
 import kis_pos_db  # 위에서 만든 모듈
 
 

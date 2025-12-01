@@ -7,7 +7,7 @@ import threading
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 
-from kis_functions import KISAPI  # ✅ 새 버전으로 변경
+from kis_functions_old import KISAPI 
 
 
 class KISTestGUI:
@@ -39,7 +39,7 @@ class KISTestGUI:
         summary.pack(fill="x", padx=10, pady=5)
 
         self.var_cash = tk.StringVar(value="예수금: -")
-        self.var_eval_amt = tk.StringVar(value="주식평가액: -")
+        self.var_eval_amt = tk.StringVar(value="평가금액: -")
         self.var_total_asset = tk.StringVar(value="총자산(추정): -")
         self.var_eval_pl = tk.StringVar(value="평가손익: -")
 
@@ -107,22 +107,19 @@ class KISTestGUI:
         self.status_label.config(text="상태: 연결 정상", foreground="green")
         self.btn_test.config(state="normal")
 
-        # ✅ kis_functions.get_summary() 구조에 맞게 키 이름 수정
         cash = summary.get("cash", 0.0)
-        stock_value = summary.get("stock_value", 0.0)
+        eval_amt = summary.get("eval_amount", 0.0)
         total_asset = summary.get("total_asset", 0.0)
-        pl_amount = summary.get("pl_amount", 0.0)
+        eval_pl = summary.get("eval_pl", 0.0)
 
         self.var_cash.set(f"예수금: {cash:,.0f}원")
-        self.var_eval_amt.set(f"주식평가액: {stock_value:,.0f}원")
+        self.var_eval_amt.set(f"평가금액: {eval_amt:,.0f}원")
         self.var_total_asset.set(f"총자산(추정): {total_asset:,.0f}원")
-        self.var_eval_pl.set(f"평가손익: {pl_amount:,.0f}원")
+        self.var_eval_pl.set(f"평가손익: {eval_pl:,.0f}원")
 
-        # 테이블 초기화
         for row in self.tree.get_children():
             self.tree.delete(row)
 
-        # ✅ kis_functions.get_positions() 구조에 맞게 pl_amount 사용
         for p in positions:
             self.tree.insert(
                 "",
@@ -132,15 +129,13 @@ class KISTestGUI:
                     p.get("name", ""),
                     f"{p.get('qty', 0):.0f}",
                     f"{p.get('avg_price', 0):,.0f}",
-                    f"{p.get('pl_amount', 0):,.0f}",
+                    f"{p.get('eval_pl', 0):,.0f}",
                 ),
             )
 
-        # Raw summary log
         self.log_area.delete("1.0", tk.END)
-        self.log_area.insert(tk.END, "[SUMMARY RAW 전체]\n")
-        raw = summary.get("raw", {})
-        self.log_area.insert(tk.END, str(raw)[:4000])
+        self.log_area.insert(tk.END, "[SUMMARY RAW 일부]\n")
+        self.log_area.insert(tk.END, str(summary.get("raw", {}))[:2000])
 
     # -----------------------------------------------------
     # 실패 시 GUI 반영
