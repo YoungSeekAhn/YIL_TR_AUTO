@@ -17,9 +17,60 @@ import time
 import threading
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, List
+from datetime import datetime, timedelta
+#from pykrx import stock
 
 import requests
 
+
+def is_trading_day(date: str) -> bool:
+    TRADING_CALENDAR = stock.get_trading_dates()   # 한번만 호출, 캐싱
+    return date in TRADING_CALENDAR
+
+# ──────────────────────────────────────────────
+# ✅ 가장 최근 거래일
+# ──────────────────────────────────────────────
+def last_trading_day(ref: datetime | None = None) -> str:
+    """
+    기준일(ref) 포함하여 가장 최근 거래일 'YYYYMMDD' 반환.
+    ref가 None이면 오늘 기준.
+    """
+    if ref is None:
+        ref = datetime.today()
+
+    d = ref
+    while True:
+        ymd = d.strftime("%Y%m%d")
+        if is_trading_day(ymd):
+            return ymd
+        d -= timedelta(days=1)
+
+
+# ──────────────────────────────────────────────
+# ✔ 리포트 기준일
+#    - 월/토/일 → 최근 거래일 (보통 금요일)
+#    - 화~금     → 최근 거래일 이전 거래일
+# ──────────────────────────────────────────────
+def last_report_day(ref: datetime | None = None) -> str:
+    if ref is None:
+        ref = datetime.today()
+
+    weekday = ref.weekday()   # 월0 ~ 일6
+    last_trade = last_trading_day(ref)
+
+    # 월요일(0), 토요일(5), 일요일(6): 최근 거래일 = 금요일
+    if weekday in (0, 5, 6):
+        return last_trade
+
+    # 화~금: 최근 거래일 하루 전 거래일
+    d = datetime.strptime(last_trade, "%Y%m%d") - timedelta(days=1)
+
+    while True:
+        ymd = d.strftime("%Y%m%d")
+        if is_trading_day(ymd):
+            return ymd
+        d -= timedelta(days=1)
+        
 
 # ============================================================
 # ① Config & Constants
@@ -213,7 +264,7 @@ class AccountService:
         """
         예수금, 평가금액, 손익 등 요약값 반환
 
-        안소현 님이 제공한 SUMMARY RAW 구조 기준:
+        SUMMARY RAW 구조 기준:
         - raw["output2"][0] 에서 주요 값 사용
             dnca_tot_amt        : 예수금
             scts_evlu_amt       : 주식 평가금액
