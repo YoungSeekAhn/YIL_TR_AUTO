@@ -13,6 +13,9 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from TRConfig import config
+from kis_functions import last_report_day
+from kis_tr_adj import adjust_signals_based_on_trends
 
 from kis_functions import KISAPI
 from kis_pos_db import (
@@ -351,9 +354,9 @@ def main(argv: List[str]) -> None:
     """
 
         # 리포트 일자/경로
-    #config.end_date = last_report_day()
-    #csv_path = Path(config.price_report_dir) / f"Report_{config.end_date}" / f"Trading_price_{config.end_date}.csv"
-    csv_path = Path('C:/Users/30211/vs_code/YIL_TR_AUTO/Report_20251128/Trading_price_20251128.csv')
+    config.end_date = last_report_day()
+    csv_path = Path(config.price_report_dir) / f"Report_{config.end_date}" / f"Trading_price_{config.end_date}.csv"
+    #csv_path = Path('C:/Users/30211/vs_code/YIL_TR_AUTO/Report_20251128/Trading_price_20251128.csv')
     
     if not csv_path.exists():
         print(f"[ERROR] CSV 파일을 찾을 수 없습니다: {csv_path}")
@@ -368,6 +371,12 @@ def main(argv: List[str]) -> None:
     # 1) CSV 시그널 로딩
     signals = load_signals_from_csv(csv_path)
     print(f"[INFO] CSV 시그널 {len(signals)}건 로딩 완료")
+    # 결과 출력
+    adjusted_signals = adjust_signals_based_on_trends(signals)
+    for signal in adjusted_signals:
+        print(f"종목: {signal['name']} ({signal['code']})")
+        print(f"매수가: {signal['entry']}, SL: {signal['sl']}, TP: {signal['tp']}")
+        print("---------")
 
     # 2) 신규 포지션 오픈
     open_new_positions_from_signals(kis, signals)
@@ -378,3 +387,5 @@ def main(argv: List[str]) -> None:
 
 if __name__ == "__main__":
     main(sys.argv)
+
+

@@ -18,14 +18,15 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, List
 from datetime import datetime, timedelta
-#from pykrx import stock
+from pykrx import stock
 
 import requests
 
 
-def is_trading_day(date: str) -> bool:
-    TRADING_CALENDAR = stock.get_trading_dates()   # 한번만 호출, 캐싱
-    return date in TRADING_CALENDAR
+def is_trading_day(yyyymmdd: str, ticker: str = "005930") -> bool:
+    """해당 날짜가 거래일인지 여부 반환 (티커 일봉 데이터 존재 여부로 판단)."""
+    df = stock.get_market_ohlcv_by_date(yyyymmdd, yyyymmdd, ticker)
+    return df is not None and len(df) > 0
 
 # ──────────────────────────────────────────────
 # ✅ 가장 최근 거래일
@@ -423,57 +424,96 @@ class OrderService:
     def __init__(self, client: KISClient):
         self.client = client
 
-    def _tr_id_cash(self, side: str) -> str:
+    # 공통 주문 헬퍼
+    def _order_cash(
+        self,
+        tr_id: str,
+        symbol: str,
+        qty: int,
+        ord_dvsn: str,
+        price: float | int,
+    ) -> Dict[str, Any]:
         """
-        국내주식 현금주문 tr_id 결정 (모의/실전 + 매수/매도)
-        - BUY  : TTTC0802U / VTTC0802U
-        - SELL : TTTC0801U / VTTC0801U
+        현금 주문 공통 함수
+
+        - tr_id: KIS 주문 TR ID
+            * 매수: TTTC0802U (예시)
+            * 매도: TTTC0801U (예시)
+        - ord_dvsn:
+            * "01" : 시장가
+            * "00" : 지정가
+        - price:
+            * 시장가일 때는 0 또는 "0"
+            * 지정가일 때는 호가단위에 맞게 정수 가격
         """
-        side = side.upper()
-        v = self.client.config.virtual
-        if side == "BUY":
-            return "VTTC0802U" if v else "TTTC0802U"
-        elif side == "SELL":
-            return "VTTC0801U" if v else "TTTC0801U"
+        if ord_dvsn == "01":
+            ord_unpr = "0"
         else:
-            raise ValueError(f"side must be 'BUY' or 'SELL', got {side}")
+            ord_unpr = str(int(round(price)))
+
+        path = "/uapi/domestic-stock/v1/trading/order-cash"
+        headers = {
+            "tr_id": tr_id,
+        }
+        body = {
+            "CANO": self.client.config.cano,
+            "ACNT_PRDT_CD": self.client.config.acnt_prdt_cd,
+            "PDNO": symbol,
+            "ORD_DVSN": ord_dvsn,
+            "ORD_QTY": str(qty),
+            "ORD_UNPR": ord_unpr,
+        }
+        return self.client.request("POST", path, headers=headers, body=body)
+
+    # ---------------- 매수/매도 래퍼 ----------------
 
     def buy_market(self, symbol: str, qty: int) -> Dict[str, Any]:
         """
-        시장가 매수 주문 예시
+        시장가 매수
         """
-        path = "/uapi/domestic-stock/v1/trading/order-cash"
-        headers = {
-            "tr_id": self._tr_id_cash("BUY"),
-        }
-        body = {
-            "CANO": self.client.config.cano,
-            "ACNT_PRDT_CD": self.client.config.acnt_prdt_cd,
-            "PDNO": symbol,
-            "ORD_DVSN": "01",   # 시장가
-            "ORD_QTY": str(qty),
-            "ORD_UNPR": "0",
-        }
-        return self.client.request("POST", path, headers=headers, body=body)
+        return self._order_cash(
+            tr_id="TTTC0802U",  # ⚠ 실제 환경에 맞게 조정
+            symbol=symbol,
+            qty=qty,
+            ord_dvsn="01",      # 시장가
+            price=0,
+        )
 
     def sell_market(self, symbol: str, qty: int) -> Dict[str, Any]:
         """
-        시장가 매도 주문 예시
+        시장가 매도
         """
-        path = "/uapi/domestic-stock/v1/trading/order-cash"
-        headers = {
-            "tr_id": self._tr_id_cash("SELL"),
-        }
-        body = {
-            "CANO": self.client.config.cano,
-            "ACNT_PRDT_CD": self.client.config.acnt_prdt_cd,
-            "PDNO": symbol,
-            "ORD_DVSN": "01",   # 시장가
-            "ORD_QTY": str(qty),
-            "ORD_UNPR": "0",
-        }
-        return self.client.request("POST", path, headers=headers, body=body)
+        return self._order_cash(
+            tr_id="TTTC0801U",  # ⚠ 실제 환경에 맞게 조정
+            symbol=symbol,
+            qty=qty,
+            ord_dvsn="01",      # 시장가
+            price=0,
+        )
 
+    def buy_limit(self, symbol: str, qty: int, price: float) -> Dict[str, Any]:
+        """
+        지정가 매수 (LIMIT BUY)
+        """
+        return self._order_cash(
+            tr_id="TTTC0802U",  # 보통 현금 매수 TR
+            symbol=symbol,
+            qty=qty,
+            ord_dvsn="00",      # 지정가
+            price=price,
+        )
+
+    def sell_limit(self, symbol: str, qty: int, price: float) -> Dict[str, Any]:
+        """
+        지정가 매도 (LIMIT SELL)
+        """
+        return self._order_cash(
+            tr_id="TTTC0801U",  # 보통 현금 매도 TR
+            symbol=symbol,
+            qty=qty,
+            ord_dvsn="00",      # 지정가
+            price=price,
+        )
 
 class MarketService:
     """

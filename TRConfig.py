@@ -27,7 +27,7 @@ class TRConfig:
          
     predict_result_dir: str = "./_predict_result"  # 출력 결과 저장 디렉토리
     predict_report_dir: str = "./_predict_report"  # 예측 결과 저장 디렉토리
-    price_report_dir: str = "C:/Users/ganys/python_work/YIL_trading/_price_report"  # 분석 결과 저장 디렉토리
+    price_report_dir: str = "C:/Users/ganys/python_work/YIL_trading/dist/_price_report"  # 분석 결과 저장 디렉토리
     
     env_dir: str = "./kis_trade"  # .env 파일 경로 (자동매매용)
 

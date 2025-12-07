@@ -21,6 +21,8 @@ import time
 from datetime import datetime, time as dtime
 from pathlib import Path
 from typing import List, Optional
+from TRConfig import config
+from kis_functions import last_report_day
 
 from kis_trading import (
     KISAPI,
@@ -107,9 +109,7 @@ def run_scheduler(signals_csv: Path) -> None:
                     csv_preload_done = True
                 except Exception as e:
                     print(f"[ERROR] CSV 시그널 로딩 실패: {e}")
-                    # 계속 재시도할지, 종료할지는 정책에 따라 다름.
-                    # 여기서는 한 번 실패해도 다음 루프에서 다시 시도 가능하도록
-                    # csv_preload_done 을 그대로 False 로 둠.
+
 
             # -------------------------------
             # 2) 09:00 이후: 신규 매수 + TP 예약 (한 번만)
@@ -203,8 +203,14 @@ def main(argv: List[str]) -> None:
         print("Usage: python yil_scheduler.py <signals_csv_path>")
         print("예:   python yil_scheduler.py signals_2025-12-02.csv")
         return
-
-    csv_path = Path(argv[1])
+        # 리포트 일자/경로
+    config.end_date = last_report_day()
+    csv_path = Path(config.price_report_dir) / f"Report_{config.end_date}" / f"Trading_price_{config.end_date}.csv"
+    #csv_path = Path('C:/Users/30211/vs_code/YIL_TR_AUTO/Report_20251128/Trading_price_20251128.csv')
+    
+    if not csv_path.exists():
+        print(f"[ERROR] CSV 파일을 찾을 수 없습니다: {csv_path}")
+        return
     run_scheduler(csv_path)
 
 
