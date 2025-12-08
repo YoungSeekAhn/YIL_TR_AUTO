@@ -13,6 +13,8 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from dateutil.parser import isoparse
+
 from TRConfig import config
 from kis_functions import last_report_day
 from kis_tr_adj import adjust_signals_based_on_trends
@@ -250,22 +252,36 @@ def open_new_positions_from_signals(
 # OPEN 포지션 TP/SL/만기 체크 및 청산
 # ============================================================
 
-def process_open_positions(kis: KISAPI) -> None:
+def parse_iso(dt_str: str) -> Optional[datetime]:
+    if not dt_str:
+        return None
+    try:
+        return isoparse(dt_str)
+    except Exception:
+        return None
+
+
+def process_open_positions(kis: KISAPI, do_order: bool = True, now: Optional[datetime] = None) -> None:
     """
     DB에 OPEN 상태인 포지션들을 순회하면서:
     - side=BUY 기준:
-        - 현재가 >= tp → TP 청산
-        - 현재가 <= sl → SL 청산
-    - valid_until 이 지난 경우 → TIMEOUT 청산
+        - 현재가 >= tp → TP 청산 후보
+        - 현재가 <= sl → SL 청산 후보
+    - valid_until 이 지난 경우 → TIMEOUT 청산 후보
+
+    do_order:
+        True  → 청산 조건 충족 시 실제로 KIS 시장가 주문까지 실행
+        False → 주문은 보내지 않고, (향후) 상태 점검/로그 용도로만 사용 가능
     """
     open_positions = get_open_positions()
     if not open_positions:
         print("[INFO] DB에 OPEN 포지션 없음 → 청산 로직 스킵")
         return
 
-    print(f"[INFO] OPEN 포지션 {len(open_positions)}건 TP/SL/만기 체크 시작")
+    if now is None:
+        now = datetime.now().astimezone()
 
-    now = datetime.now().astimezone()
+    print(f"[INFO] OPEN 포지션 {len(open_positions)}건 TP/SL/만기 체크 시작 (do_order={do_order})")
 
     for pos in open_positions:
         # 현재가 조회
@@ -282,8 +298,8 @@ def process_open_positions(kis: KISAPI) -> None:
             continue
 
         print(
-            f"[CHECK] {pos.code} {pos.name}: entry={pos.entry}, "
-            f"tp={pos.tp}, sl={pos.sl}, cur={cur_price}"
+            f"[CHECK] {pos.code} {pos.name}: "
+            f"entry={pos.entry}, tp={pos.tp}, sl={pos.sl}, cur={cur_price}"
         )
 
         reason: Optional[str] = None
@@ -295,7 +311,7 @@ def process_open_positions(kis: KISAPI) -> None:
             elif pos.sl is not None and cur_price <= pos.sl:
                 reason = "SL"
         else:
-            # SELL(숏) 전략을 나중에 도입한다면 여기서 반대로 처리
+            # TODO: SELL(숏) 전략 도입시 반대로 처리
             pass
 
         # 2) 만기(valid_until) 체크 (TP/SL 안 걸렸을 때만)
@@ -304,37 +320,54 @@ def process_open_positions(kis: KISAPI) -> None:
             if dt_valid is not None and now >= dt_valid:
                 reason = "TIMEOUT"
 
+        # 청산 조건이 하나도 안 걸리면 스킵
         if reason is None:
-            continue  # 아직 청산 조건 미충족
-
-        # ---- 청산 처리 ----
-        try:
-            qty = pos.qty
-            print(f"[EXIT] {pos.code} {pos.name}: reason={reason}, qty={qty}, px={cur_price}")
-
-            # 시장가 매도
-            if pos.side.upper() == "BUY":
-                resp = kis.order.sell_market(pos.code, qty)
-            else:
-                # 나중에 숏 로직이 생기면 여기서 BUY로 청산
-                resp = kis.order.buy_market(pos.code, qty)
-            print("  → 주문 응답:", resp.get("msg1", resp))
-        except Exception as e:
-            print(f"[ERROR] {pos.code} {pos.name} 청산 주문 실패: {e}")
             continue
 
-        # DB 포지션 상태 업데이트 (실현손익, 수익률, 보유일수 계산 포함)
-        exit_time_iso = now.isoformat()
-        try:
-            close_position(
-                pos_id=pos.id,
-                exit_price=cur_price,
-                exit_time=exit_time_iso,
-                exit_reason=reason,
-            )
-            print(f"  → DB 포지션 id={pos.id} CLOSED (reason={reason})")
-        except Exception as e:
-            print(f"[ERROR] DB close_position 실패 (id={pos.id}): {e}")
+        print(
+            f"[HIT] {pos.code} {pos.name}: "
+            f"reason={reason}, qty={pos.qty}, cur={cur_price}, do_order={do_order}"
+        )
+
+        order_ok = True
+
+        # ---- 실제 주문 (장중/실거래 시에만) ----
+        if do_order:
+            try:
+                qty = pos.qty
+                print(f"[EXIT-ORDER] {pos.code} {pos.name}: reason={reason}, qty={qty}, px={cur_price}")
+
+                if pos.side.upper() == "BUY":
+                    resp = kis.order.sell_market(pos.code, qty)
+                else:
+                    # 나중에 숏 로직이 생기면 여기서 BUY로 청산
+                    resp = kis.order.buy_market(pos.code, qty)
+
+                print("  → 주문 응답:", resp.get("msg1", resp))
+            except Exception as e:
+                order_ok = False
+                print(f"[ERROR] {pos.code} {pos.name} 청산 주문 실패: {e}")
+
+        # ---- DB 포지션 상태 업데이트 ----
+        # do_order=False 인 경우 → 순수 EOD sync 용으로도 쓸 수 있게,
+        # 주문 여부와 관계없이 DB close 를 할지/말지는 정책적으로 선택 가능.
+        # 여기서는:
+        #   - do_order=False => EOD에서 '논리적으로는 끝난 포지션' 을 DB상으로도 CLOSE
+        #   - do_order=True  => 주문까지 성공(order_ok=True) 한 경우에만 CLOSE
+        if (not do_order) or (do_order and order_ok):
+            exit_time_iso = now.isoformat()
+            try:
+                close_position(
+                    pos_id=pos.id,
+                    exit_price=cur_price,
+                    exit_time=exit_time_iso,
+                    exit_reason=reason,
+                )
+                print(f"  → DB 포지션 id={pos.id} CLOSED (reason={reason}, do_order={do_order})")
+            except Exception as e:
+                print(f"[ERROR] DB close_position 실패 (id={pos.id}): {e}")
+        else:
+            print(f"[INFO] 주문 실패로 DB CLOSE 보류 (id={pos.id})")
 
 
 # ============================================================

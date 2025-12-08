@@ -33,88 +33,90 @@ def get_minute_data_from_yahoo(symbol: str):
     stock = yf.Ticker(yf_symbol)
     minute_data = stock.history(period="1d", interval="1m", start=today, end=today)
 
-    # 시간대 필터링 (9시부터 10시까지)
+    # 시간대 필터링 (9시부터 9시30분 까지)
     minute_data['datetime'] = minute_data.index  # 인덱스를 datetime으로 변환
-    minute_data = minute_data.between_time('09:01', '10:00')  # 9시~10시 구간만 필터링
+    minute_data = minute_data.between_time('09:00', '09:30')  # 9시~10시 구간만 필터링
 
     return minute_data
 
 # 3. ATR 계산 (변동성 계산)
 def calculate_atr(df, period=14):
-    df['tr'] = df['High'] - df['Low']
-    df['tr'] = df[['tr', (df['High'] - df['Close'].shift()).abs(), (df['Low'] - df['Close'].shift()).abs()]].max(axis=1)
-    df['atr'] = df['tr'].rolling(window=period).mean()
+    df = df.copy()
+    df['prev_close'] = df['Close'].shift(1)
+    df['tr1'] = df['High'] - df['Low']
+    df['tr2'] = (df['High'] - df['prev_close']).abs()
+    df['tr3'] = (df['Low'] - df['prev_close']).abs()
+    df['TR'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
+    df['ATR'] = df['TR'].rolling(window=period).mean()
     return df
 
 # 4. EMA 계산 (이동평균)
-def calculate_ema(df, period=14):
-    df['ema'] = df['Close'].ewm(span=period, adjust=False).mean()
+def calculate_ema(df, period=20):
+    df = df.copy()
+    df['EMA'] = df['Close'].ewm(span=period, adjust=False).mean()
     return df
 
-
-# 트렌드 분석 함수
-def analyze_trend(df):
+# 5. Entry/SL/TP 조정 함수
+def adjust_entry_sl_tp(min_df, csv_entry, csv_sl, csv_tp, atr, sl_mult=1.5, tp_mult=1.5):
+    
     df = calculate_atr(df)
     df = calculate_ema(df)
     
-    # 트렌드 분석
-    df['trend'] = np.where(df['Close'] > df['ema'], 'up', 'down')
-    
-    # 트렌드를 기반으로 조정할 수 있는 매수/매도 조건을 추가할 수 있음
-    df['signal'] = np.where(df['trend'] == 'up', 'BUY', 'SELL')
-    
-    return df
+    last = df.iloc[-1]
+    close = last['Close']
+    ema = last['EMA']
+    atr = last['ATR']
 
-# 6. SL/TP 조정 (변동성에 따른 조정)
-def adjust_price_based_on_volatility(atr, entry_price, sl, tp):
-    volatility_factor = 1.5  # ATR에 대한 변동성 배수 (조정 가능)
+    # 1) 추세 확인
+    is_up = close > ema
 
-    # 변동성이 급등하면 SL을 넓게, TP를 좁게
-    if atr > 2 * np.mean(atr):  # ATR이 평균보다 2배 이상 클 경우
-        sl_adjusted = entry_price - 2 * atr  # 더 넓은 SL
-        tp_adjusted = entry_price + 2 * atr  # 더 넓은 TP
+    if not is_up:
+        return {
+            "use": False,
+            "reason": "downtrend",
+        }
+    # 2) 엔트리 조정: EMA 근처 범위 안에서만 유효
+    allowed_band = atr * 0.5  # 0.5*ATR 이내에서만 매수
+    if abs(close - csv_entry) > allowed_band:
+        entry = close  # 혹은 스킵 정책 선택 가능
     else:
-        sl_adjusted = entry_price - atr * volatility_factor
-        tp_adjusted = entry_price + atr * volatility_factor
-    
-    # 손절가, 익절가가 현재가에 비해 너무 멀거나 가까우면 보정
-    if sl_adjusted < entry_price - atr:  # 너무 낮으면 보정
-        sl_adjusted = entry_price - atr
-    if tp_adjusted > entry_price + atr:  # 너무 높으면 보정
-        tp_adjusted = entry_price + atr
-    
-    return sl_adjusted, tp_adjusted
+        entry = csv_entry
+        
+    atr_sl = entry - atr * sl_mult
+    atr_tp = entry + atr * tp_mult
 
-# 7. 매매 시그널에 대해 SL/TP 조정
+    # CSV 기본 조건 존중하면서도 ATR 기반으로 보정
+    new_sl = min(csv_sl, atr_sl)
+    new_tp = max(csv_tp, atr_tp)
+
+    return entry, new_sl, new_tp
+
+
+# 7. 매매 시그널에 대해 Entry/SL/TP 조정
 def adjust_signals_based_on_trends(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     adj_signals = []
 
     for signal in signals:
         symbol = signal['code']
-        entry_price = signal['entry']
-        tp = signal['tp']
-        sl = signal['sl']
+        csv_entry = signal['entry']
+        csv_tp = signal['tp']
+        csv_sl = signal['sl']
 
         # 1분봉 데이터를 가져와 트렌드 분석 후 ATR 계산
         minute_data = get_minute_data_from_yahoo(symbol)
         minute_df = pd.DataFrame(minute_data)
-        #minute_df['datetime'] = pd.to_datetime(minute_df['datetime'])
-        #minute_df.set_index('datetime', inplace=True)
-
-        # 트렌드 분석 및 ATR 계산
-        minute_df = analyze_trend(minute_df)
-        atr = minute_df['atr'].iloc[-1]  # 최신 ATR 값
+        minute_df['datetime'] = pd.to_datetime(minute_df['datetime'])
+        minute_df.set_index('datetime', inplace=True)
 
         # SL, TP 가격 조정
-        sl_adjusted, tp_adjusted = adjust_price_based_on_volatility(atr, entry_price, sl, tp)
+        entry_adjusted, sl_adjusted, tp_adjusted = adjust_entry_sl_tp(minute_df, csv_entry, csv_sl, csv_tp)
 
         # 조정된 시그널 저장
         adj_signal = signal.copy()
+        adj_signal['entry'] = entry_adjusted
         adj_signal['sl'] = sl_adjusted
         adj_signal['tp'] = tp_adjusted
-
+        
         adj_signals.append(adj_signal)
 
     return adj_signals
-
-
