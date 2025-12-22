@@ -76,46 +76,47 @@ def last_report_day(ref: datetime | None = None) -> str:
 # ============================================================
 # ① Config & Constants
 # ============================================================
+REAL_BASE_URL_DEFAULT = "https://openapi.koreainvestment.com:9443"
+VTS_BASE_URL_DEFAULT  = "https://openapivts.koreainvestment.com:29443"
 
 @dataclass
 class KISConfig:
     app_key: str
     app_secret: str
     account_no: str              # 예: "12345678-01"
-    base_url: str                # 예: 실전 "https://openapi.koreainvestment.com:9443"
-    virtual: bool = False        # 모의투자 여부 (True: 모의, False: 실전)
+    base_url: str
+    virtual: bool
 
     @classmethod
     def from_env(cls) -> "KISConfig":
-        """
-        환경 변수에서 설정 읽기용 헬퍼
-        - KIS_APP_KEY
-        - KIS_APP_SECRET
-        - KIS_ACCOUNT_NO   : "12345678-01" 형식
-        - KIS_BASE_URL     : 설정 없으면 실전 URL 기본값
-        - KIS_VIRTUAL      : "true" / "false"
-        """
+        virtual = os.environ.get("KIS_VIRTUAL", "false").lower() == "true"
+
+        if virtual:
+            app_key = os.environ.get("KIS_APPKEY_VTS", "")
+            app_secret = os.environ.get("KIS_APPSECRET_VTS", "")
+            account_no = os.environ.get("KIS_ACCOUNT_VTS", "")
+            base_url = os.environ.get("KIS_BASE_URL_VTS", VTS_BASE_URL_DEFAULT)
+        else:
+            app_key = os.environ.get("KIS_APP_KEY", "")
+            app_secret = os.environ.get("KIS_APP_SECRET", "")
+            account_no = os.environ.get("KIS_ACCOUNT_NO", "")
+            base_url = os.environ.get("KIS_BASE_URL_REAL", REAL_BASE_URL_DEFAULT)
+
         return cls(
-            app_key=os.environ.get("KIS_APP_KEY", ""),
-            app_secret=os.environ.get("KIS_APP_SECRET", ""),
-            account_no=os.environ.get("KIS_ACCOUNT_NO", ""),
-            base_url=os.environ.get(
-                "KIS_BASE_URL",
-                "https://openapi.koreainvestment.com:9443",  # 실전 기본
-            ),
-            virtual=os.environ.get("KIS_VIRTUAL", "false").lower() == "true",
+            app_key=app_key,
+            app_secret=app_secret,
+            account_no=account_no,
+            base_url=base_url,
+            virtual=virtual,
         )
 
     @property
     def cano(self) -> str:
-        """계좌번호 앞 8자리"""
         return self.account_no.split("-")[0]
 
     @property
     def acnt_prdt_cd(self) -> str:
-        """계좌상품코드 (뒷 2자리)"""
         return self.account_no.split("-")[1]
-
 
 # ============================================================
 # ② Core HTTP Client (Token 관리 + 공통 request)

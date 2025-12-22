@@ -1,404 +1,404 @@
 """
 kis_trading.py
-----------------
-YIL_AUTO_TRADE 트레이딩 엔진.
-
-기능:
-- KIS 계좌/DB 상태를 기반으로
-  오늘자 CSV에서 새로 진입할 종목 결정
-- 예수금 한도 / 추가매수 금지 / CSV 순서대로 매수
-- 실제 KIS 주문 실행 (현재는 '시장가 매수' 예시)
-- 체결된 것으로 간주하고 DB에 포지션 기록
-
-1. 만약 내 계좌의 보유종목에 같은 종목이 존재할 경우, 추가 매수는 하지 않는다.
-2. 기본은 매수가, 익절가, 손절가에서 매매를 하루에 완료하는 것으로 하며, 만약 전일 매수는 했는데, 전일 익절 또는 손절이 발생하지 않으면, 
-   오늘 매매를 계속해야 한다. 또한 오늘 매매가 발생하지 않으면 내일도 진행해야 한다.
-3. 어제의 종목이 오늘의 종목과 일치 하지 않음으로, 어제의 종목에 대한 tp /sl등 종목에 대한 정보는 보관되어 있어야 한다.
-4. DB에 매수 당시의 csv 일부정보(1w_score, RR, 신뢰도등) 포함되면 좋겠어. 또한, 청산시 수익금, 수익율등 향후 분석을 위한 정보도 포함
-   
-※ 주의:
-  - 실제 체결 가격/체결 여부는 KIS API 응답 구조에 맞게
-    추가 구현/보정이 필요합니다.
+- 일별 CSV 시그널을 읽어서 신규 포지션 오픈
+- DB(kis_pos_db)에 기록된 OPEN 포지션을 TP/SL/만기 기준으로 청산
+- KIS API (kis_functions) + SQLite 포지션 DB (kis_pos_db) 연동
 """
 
-from dataclasses import dataclass
-from datetime import datetime
-from typing import List, Dict, Any, Optional
-from pathlib import Path
+from __future__ import annotations
+
+import csv
 import sys
-import pandas as pd
+from dataclasses import asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from dateutil.parser import isoparse
 
-from kis_functions import KISAPI, last_report_day
 from TRConfig import config
+from kis_functions import last_report_day
+from kis_tr_adj import adjust_signals_based_on_trends
 
-import kis_pos_db  # 위에서 만든 모듈
+from kis_functions import KISAPI
+from kis_pos_db import (
+    DB_PATH,
+    Position,
+    init_db,
+    insert_position,
+    get_open_positions,
+    close_position,
+)
 
 
 # ============================================================
-# 설정 & 주문 계획 구조체
+# 유틸 헬퍼
 # ============================================================
 
-@dataclass
-class TradingConfig:
+def float_or_none(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if s == "":
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def to_iso_now() -> str:
+    """현재 시각을 ISO8601 문자열로 반환 (타임존 포함)"""
+    return datetime.now().astimezone().isoformat()
+
+
+# ============================================================
+# CSV 시그널 로딩
+# ============================================================
+
+def load_signals_from_csv(csv_path: Path) -> List[Dict[str, Any]]:
     """
-    기본 전략 파라미터.
-    지금은 단순히 CSV 순서 + 예수금 한도 + 추가 매수 금지만 적용.
+    일별 시그널 CSV를 읽어서 dict 리스트로 반환.
+
+    기대하는 컬럼명 (질문에서 준 헤더 기준):
+    - 종목명
+    - 종목코드
+    - 권장호라이즌
+    - 매수가(entry)
+    - 익절가(tp)
+    - 손절가(sl)
+    - RR
+    - Score_1w
+    - ord_qty
+    - side
+    - confidence
+    - valid_until
     """
-    min_confidence: float = 0.0   # 필요하면 필터링에 사용
-    min_rr: float = 0.0           # 필요하면 필터링에 사용
+    signals: List[Dict[str, Any]] = []
 
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                code_raw = (row.get("종목코드") or "").strip()
+                if not code_raw:
+                    continue
+                # 6자리 코드로 맞추기 (앞에 0 padding)
+                code = code_raw.zfill(6)
 
-@dataclass
-class OrderPlan:
-    code: str
-    name: str
-    side: str     # "BUY" (현재 기준)
-    qty: int
-    entry: float  # CSV에서 제안된 매수가 (참고용)
-    tp: Optional[float]
-    sl: Optional[float]
-    reason: str   # "csv_seq_buy" 등
+                name = (row.get("종목명") or "").strip()
+
+                side = (row.get("side") or "BUY").upper()
+                qty = int(float(row.get("ord_qty") or 0))
+
+                entry = float(row.get("매수가(entry)") or 0)
+                tp = float_or_none(row.get("익절가(tp)"))
+                sl = float_or_none(row.get("손절가(sl)"))
+
+                score_1w = float_or_none(row.get("Score_1w"))
+                rr = float_or_none(row.get("RR"))
+                confidence = float_or_none(row.get("confidence"))
+                horizon = (row.get("권장호라이즌") or "").strip()
+                valid_until = (row.get("valid_until") or "").strip()
+
+                if qty <= 0 or entry <= 0:
+                    # 수량이나 매수가가 0 또는 음수면 스킵
+                    continue
+
+                signals.append(
+                    {
+                        "code": code,
+                        "name": name,
+                        "side": side,
+                        "qty": qty,
+                        "entry": entry,
+                        "tp": tp,
+                        "sl": sl,
+                        "score_1w": score_1w,
+                        "rr": rr,
+                        "confidence": confidence,
+                        "horizon": horizon,
+                        "valid_until": valid_until,
+                        "raw_row": row,
+                    }
+                )
+            except Exception as e:
+                print(f"[WARN] CSV row 파싱 실패: {e}, row={row}")
+                continue
+
+    return signals
 
 
 # ============================================================
-# TradingEngine
+# 신규 시그널 → 포지션 오픈
 # ============================================================
 
-class TradingEngine:
-    def __init__(self, kis: KISAPI, config: Optional[TradingConfig] = None):
-        self.kis = kis
-        self.config = config or TradingConfig()
+def open_new_positions_from_signals(
+    kis: KISAPI,
+    signals: List[Dict[str, Any]],
+) -> None:
+    """
+    1) 계좌 예수금 확인
+    2) KIS 현재 보유종목 + DB OPEN 포지션 확인
+    3) CSV 시그널 순서대로:
+       - 이미 계좌 보유 or DB OPEN이면 스킵
+       - entry * qty > 남은 예수금이면 스킵
+       - 지정가 매수 주문 (buy_limit)
+       - DB에 Position(status="OPEN") 기록
+    """
+    if not signals:
+        print("[INFO] CSV 시그널 없음 → 신규 포지션 오픈 스킵")
+        return
 
-    # --------------------------------------------------------
-    # CSV 로드
-    # --------------------------------------------------------
-    def load_signal_csv(self, csv_path: str) -> pd.DataFrame:
-        """
-        오늘자 매매 CSV를 읽어 DataFrame으로 반환.
-        종목코드는 앞자리 0이 중요하므로 문자열로 읽는다.
-        """
-        df = pd.read_csv(
-            csv_path,
-            dtype={"종목코드": str},
+    # 계좌 요약 / 보유 종목
+    summary = kis.account.get_summary()
+    cash = summary.get("cash", 0.0)
+    print(f"[INFO] 현재 예수금 (dnca_tot_amt 기준): {cash:,.0f}원")
+
+    kis_pos_map = kis.account.get_positions_map()
+    print(f"[INFO] KIS 현재 보유종목 수: {len(kis_pos_map)}")
+
+    open_db_positions = get_open_positions()
+    open_db_codes = {p.code for p in open_db_positions}
+    print(f"[INFO] DB OPEN 포지션 수: {len(open_db_positions)}")
+
+    remaining_cash = float(cash)
+
+    for sig in signals:
+        code = sig["code"]
+        name = sig["name"]
+        side = sig["side"]
+        qty = sig["qty"]
+        entry = sig["entry"]
+        tp = sig["tp"]
+        sl = sig["sl"]
+
+        if side != "BUY":
+            print(f"[SKIP] {code} {name}: side={side} (현재는 BUY만 처리)")
+            continue
+
+        # 1) 이미 KIS 계좌에 보유한 종목이면 스킵
+        if code in kis_pos_map:
+            print(f"[SKIP] {code} {name}: 계좌에 이미 보유 중 → 추가 매수 금지")
+            continue
+
+        # 2) DB에 OPEN 포지션이 있으면 스킵
+        if code in open_db_codes:
+            print(f"[SKIP] {code} {name}: DB에 OPEN 포지션 존재 → 추가 매수 금지")
+            continue
+
+        est_cost = entry * qty
+        if est_cost > remaining_cash:
+            print(
+                f"[SKIP] {code} {name}: 예상 매수금액 {est_cost:,.0f}원이 남은 예수금 {remaining_cash:,.0f}원을 초과"
+            )
+            continue
+
+        # 3) 지정가 매수 주문 (ORD_DVSN=00, 지정가)
+        try:
+            price_int = int(round(entry))
+            print(
+                f"[ORDER] BUY LIMIT {code} {name} qty={qty} price={price_int} "
+                f"(예상금액 {est_cost:,.0f}원)"
+            )
+            resp = kis.order.buy_limit(code, qty, price_int)
+            print("  → 주문 응답:", resp.get("msg1", resp))
+        except Exception as e:
+            print(f"[ERROR] {code} {name} 매수 주문 실패: {e}")
+            continue
+
+        # 남은 예수금 감소(추정치)
+        remaining_cash -= est_cost
+
+        # 4) DB에 포지션 기록 (status="OPEN")
+        now_iso = to_iso_now()
+        pos = Position(
+            id=None,
+            code=code,
+            name=name,
+            side=side,
+            qty=qty,
+            entry=entry,
+            tp=tp,
+            sl=sl,
+            open_time=now_iso,
+            close_time=None,
+            status="OPEN",
+            exit_price=None,
+            exit_reason=None,
+            score_1w=sig["score_1w"],
+            rr=sig["rr"],
+            confidence=sig["confidence"],
+            horizon=sig["horizon"],
+            valid_until=sig["valid_until"],
+            note="from daily CSV signal",
         )
-        return df
 
-    # --------------------------------------------------------
-    # 매수 후보 선정 (CSV → OrderPlan 리스트)
-    # --------------------------------------------------------
-    def plan_new_entries_from_csv(self, csv_path: str) -> List[OrderPlan]:
-        """
-        CSV 내용을 기준으로:
-        - side == "BUY"인 종목만
-        - 이미 보유/OPEN 포지션인 종목은 추가 매수 금지
-        - 예수금 한도 내에서, CSV 순서대로 매수 계획 생성
-        """
-        # 1) 계좌 요약 / 예수금
-        #summary = self.kis.account.get_summary()
-        #cash = float(summary.get("cash", 0.0) or 0.0)
-        cash = 2000000.0  # 예시로 큰 금액 사용
-        
-        # 2) DB 속 OPEN 포지션 종목들
-        open_codes = set(kis_pos_db.get_open_codes())
-
-        # (선택) KIS 실제 보유 종목도 merge 할 수 있음
-        # 지금은 kis_functions.AccountService.get_positions()가 미구현 상태일 수 있으므로
-        # 나중에 필요하면 여기서 추가.
-        # ex:
-        # held_positions = self.kis.account.get_positions()
-        # held_codes = {p["code"] for p in held_positions}
-        # held_codes |= open_codes
-
-        held_codes = set(open_codes)
-
-        # 3) CSV 읽기
-        df = self.load_signal_csv(csv_path)
-
-        # 컬럼 이름 상수
-        ENTRY_COL = "매수가(entry)"
-        TP_COL = "익절가(tp)"
-        SL_COL = "손절가(sl)"
-
-        order_plans: List[OrderPlan] = []
-
-        for _, row in df.iterrows():
-            side_raw = str(row.get("side", "")).upper()
-            if side_raw != "BUY":
-                continue
-
-            code = str(row["종목코드"]).strip()
-            name = str(row["종목명"]).strip()
-
-            # 추가 매수 금지: DB/Open에 이미 존재하면 스킵
-            if code in held_codes:
-                continue
-
-            # 필터 (필요시 활성화)
-            conf = row.get("confidence")
-            rr_val = row.get("RR")
-
-            try:
-                conf_f = float(conf) if conf not in (None, "",) else 0.0
-            except Exception:
-                conf_f = 0.0
-
-            try:
-                rr_f = float(rr_val) if rr_val not in (None, "",) else 0.0
-            except Exception:
-                rr_f = 0.0
-
-            if conf_f < self.config.min_confidence:
-                # 신뢰도 필터 사용 시
-                # continue
-                pass
-
-            if rr_f < self.config.min_rr:
-                # RR 필터 사용 시
-                # continue
-                pass
-
-            # 매수가/수량
-            try:
-                entry = float(row[ENTRY_COL])
-            except Exception:
-                # 매수가가 비정상이면 스킵
-                continue
-
-            try:
-                qty = int(row.get("ord_qty", 0))
-            except Exception:
-                qty = 0
-
-            if qty <= 0:
-                continue
-
-            cost = entry * qty
-
-            # 예수금 부족하면 이 종목은 매수 후보에서 제외
-            if cost > cash:
-                continue
-
-            # TP/SL
-            tp = None
-            sl = None
-            try:
-                val = row.get(TP_COL)
-                tp = float(val) if val not in (None, "",) else None
-            except Exception:
-                pass
-
-            try:
-                val = row.get(SL_COL)
-                sl = float(val) if val not in (None, "",) else None
-            except Exception:
-                pass
-
-            plan = OrderPlan(
-                code=code,
-                name=name,
-                side="BUY",
-                qty=qty,
-                entry=entry,
-                tp=tp,
-                sl=sl,
-                reason="csv_seq_buy",
-            )
-            order_plans.append(plan)
-
-            # 예수금 차감
-            cash -= cost
-
-        return order_plans
-
-    # --------------------------------------------------------
-    # 주문 실행 + DB 등록
-    # --------------------------------------------------------
-    def execute_order_plans(self, plans: List[OrderPlan], signal_df: pd.DataFrame) -> None:
-        """
-        계획된 OrderPlan들을 실제 KIS 계좌에 주문 실행하고,
-        체결된 것으로 보고 DB에 OPEN 포지션으로 기록.
-
-        ※ 현재 예시는 '시장가 매수'로 구현.
-        ※ 실제 시스템에서는 주문 응답에서 체결 여부/체결가를 확인해서
-           entry_price를 더 정확히 반영하는 것이 좋다.
-        """
-        # signal_df는 rows를 code 기준으로 찾기 위해 사용
-        df_by_code = signal_df.set_index("종목코드", drop=False)
-
-        for plan in plans:
-            if plan.side != "BUY":
-                continue
-
-            # 1) KIS 주문 실행 (시장가 예시)
-            try:
-                # 여기에서는 시장가 매수 예시 (kis_functions.OrderService.buy_market 사용)
-                resp = self.kis.order.buy_market(plan.code, plan.qty)
-                # resp 구조에 따라 체결가를 얻을 수 있으면 entry_price로 사용
-                # 지금은 CSV 상의 entry를 그대로 entry_price로 사용
-                fill_price = plan.entry
-            except Exception as e:
-                print(f"[ERROR] Buy order failed for {plan.code}: {e}")
-                continue
-
-            # 2) CSV row 찾기
-            try:
-                row = df_by_code.loc[plan.code].to_dict()
-            except KeyError:
-                # CSV에서 못 찾으면 최소 정보만 구성
-                row = {
-                    "종목코드": plan.code,
-                    "종목명": plan.name,
-                    "매수가(entry)": plan.entry,
-                    "익절가(tp)": plan.tp,
-                    "손절가(sl)": plan.sl,
-                    "Score_1w": None,
-                    "RR": None,
-                    "confidence": None,
-                    "권장호라이즌": None,
-                    "holding_days": None,
-                    "risk_cap_used": None,
-                    "valid_until": None,
-                    "source_file": "",
-                    "요약점수(h1)": None,
-                    "요약점수(h2)": None,
-                    "요약점수(h3)": None,
-                    "warn_bad_RR": None,
-                }
-
-            # 3) DB에 OPEN 포지션 기록
-            kis_pos_db.add_open_position_from_csv_row(
-                row=row,
-                qty=plan.qty,
-                entry_price=fill_price,
-                open_time_iso=datetime.now().isoformat(timespec="seconds"),
-            )
-
-            print(
-                f"[INFO] BUY executed: {plan.code} {plan.name}, "
-                f"qty={plan.qty}, entry={fill_price}"
-            )
-
-    # --------------------------------------------------------
-    # TP/SL 체크 (골격) - 나중에 루프/스케줄러에서 호출
-    # --------------------------------------------------------
-    def check_tp_sl_and_close(self) -> None:
-        """
-        DB상의 OPEN 포지션들에 대해:
-        - 현재가 조회
-        - TP/SL 도달 시 계좌에 매도 주문 + DB에서 CLOSED로 업데이트
-
-        ※ 이 함수는 '한 번'만 검사하는 함수.
-          실제로는 일정 주기로(예: 10초마다) 호출해줘야 한다.
-        """
-        open_positions = kis_pos_db.get_open_positions()
-
-        for pos in open_positions:
-            code = pos.code
-            tp = pos.tp
-            sl = pos.sl
-
-            # TP/SL 값이 없으면 이 함수에서 관리하지 않음
-            if tp is None and sl is None:
-                continue
-
-            # 현재가 조회
-            try:
-                quote = self.kis.market.get_quote(code)
-                # quote JSON 구조에 맞게 현재가 필드를 선택해야 함.
-                # 예시: current_price = float(quote["output"]["stck_prpr"])
-                # 지금은 예시로 0.0 사용 → 실제 구현 시 수정 필수
-                current_price = 0.0
-            except Exception as e:
-                print(f"[ERROR] get_quote failed for {code}: {e}")
-                continue
-
-            should_close = False
-            reason = ""
-
-            # BUY 기준 TP/SL
-            if tp is not None and current_price >= tp:
-                should_close = True
-                reason = "tp_hit"
-            elif sl is not None and current_price <= sl:
-                should_close = True
-                reason = "sl_hit"
-
-            if not should_close:
-                continue
-
-            # 매도 주문 (시장가 예시)
-            try:
-                self.kis.order.sell_market(code, pos.qty)
-                exit_price = current_price  # 실제로는 체결가 사용
-            except Exception as e:
-                print(f"[ERROR] Sell order failed for {code}: {e}")
-                continue
-
-            # DB 업데이트
-            kis_pos_db.close_positions_for_code(
-                code=code,
-                exit_price=exit_price,
-                exit_time_iso=datetime.now().isoformat(timespec="seconds"),
-                reason=reason,
-            )
-
-            print(
-                f"[INFO] CLOSED {code} {pos.name}, "
-                f"qty={pos.qty}, exit={exit_price}, reason={reason}"
-            )
+        new_id = insert_position(pos)
+        print(f"  → DB 포지션 기록 완료 (id={new_id})")
 
 
 # ============================================================
-# 예시 main (아침 한 번 실행하는 용도)
+# OPEN 포지션 TP/SL/만기 체크 및 청산
 # ============================================================
 
-if __name__ == "__main__":
+from datetime import datetime, timezone
+
+def parse_iso(s: str, default_tz=None) -> datetime | None:
+    if not s:
+        return None
+
+    s = s.strip()
+
+    # 'Z' (UTC) 처리: fromisoformat은 'Z'를 바로 못 먹는 파이썬 버전이 많음
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+    # tz 없는 경우 기본 tz 부여
+    if dt.tzinfo is None:
+        if default_tz is None:
+            default_tz = datetime.now().astimezone().tzinfo
+        dt = dt.replace(tzinfo=default_tz)
+
+    return dt
+
+
+def process_open_positions(kis: KISAPI, do_order: bool = True, now: Optional[datetime] = None) -> None:
     """
-    간단 예시 흐름:
+    DB의 OPEN 포지션을 순회하면서 TP/SL/만기 조건 체크 후 청산 처리.
+    - do_order=True: 실제 청산 주문 실행
+    """
+    open_positions = get_open_positions()
+    if not open_positions:
+        print("[INFO] DB에 OPEN 포지션 없음 → 청산 로직 스킵")
+        return
 
-    1) DB 초기화
-    2) KIS 연결
-    3) 오늘자 CSV에서 매수 후보 선정
-    4) 주문 실행 + DB에 포지션 등록
+    if now is None:
+        now = datetime.now().astimezone()
+
+    print(f"[INFO] OPEN 포지션 {len(open_positions)}건 TP/SL/만기 체크 시작 (do_order={do_order})")
+
+    for pos in open_positions:
+        # 현재가 조회
+        try:
+            q = kis.market.get_quote(pos.code)
+            out = q.get("output", {})
+            cur_price = float(out.get("stck_prpr", "0") or 0.0)
+        except Exception as e:
+            print(f"[WARN] {pos.code} {pos.name}: 현재가 조회 실패: {e}")
+            continue
+
+        if cur_price <= 0:
+            print(f"[WARN] {pos.code} {pos.name}: 현재가 0 또는 조회 실패로 청산 판단 스킵")
+            continue
+
+        print(
+            f"[CHECK] {pos.code} {pos.name}: "
+            f"entry={pos.entry}, tp={pos.tp}, sl={pos.sl}, cur={cur_price}"
+        )
+
+        reason: Optional[str] = None
+
+        # 1) TP/SL 조건
+        if pos.side.upper() == "BUY":
+            if pos.tp is not None and cur_price >= pos.tp:
+                reason = "TP"
+            elif pos.sl is not None and cur_price <= pos.sl:
+                reason = "SL"
+        else:
+            # TODO: SELL(숏) 전략 도입시 반대로 처리
+            pass
+
+        # 2) 만기(valid_until) 체크 (TP/SL 안 걸렸을 때만)
+       # if reason is None and pos.valid_until:
+       #     dt_valid = parse_iso(pos.valid_until, default_tz=now.tzinfo)
+       #     if dt_valid is not None and now >= dt_valid:
+       #         reason = "TIMEOUT"
+
+        # 청산 조건이 하나도 안 걸리면 스킵
+        if reason is None:
+            continue
+
+        print(
+            f"[HIT] {pos.code} {pos.name}: "
+            f"reason={reason}, qty={pos.qty}, cur={cur_price}, do_order={do_order}"
+        )
+
+        order_ok = True
+
+        # ---- 실제 주문 (장중/실거래 시에만) ----
+        if do_order:
+            try:
+                qty = pos.qty
+                print(f"[EXIT-ORDER] {pos.code} {pos.name}: reason={reason}, qty={qty}, px={cur_price}")
+
+                if pos.side.upper() == "BUY":
+                    resp = kis.order.sell_market(pos.code, qty)
+                else:
+                    # 나중에 숏 로직이 생기면 여기서 BUY로 청산
+                    resp = kis.order.buy_market(pos.code, qty)
+
+                print("  → 주문 응답:", resp.get("msg1", resp))
+            except Exception as e:
+                order_ok = False
+                print(f"[ERROR] {pos.code} {pos.name} 청산 주문 실패: {e}")
+
+
+
+
+# ============================================================
+# main
+# ============================================================
+
+def main(argv: List[str]) -> None:
+    """
+    사용법:
+        python kis_trading.py signals_2025-12-01.csv
+
+    동작:
+      1) DB 초기화 (없으면 생성)
+      2) KISAPI.from_env() 로 접속 준비
+      3) CSV 시그널 읽어서 신규 포지션 오픈
+      4) DB의 OPEN 포지션 TP/SL/만기 체크 후 청산
     """
 
-    import sys
-
-    # if len(sys.argv) < 2:
-    #     print("Usage: python kis_trading.py <today_signals.csv>")
-    #     sys.exit(1)
-
-    # 리포트 일자/경로
-    #config.end_date = last_report_day()
-    #csv_path = Path(config.price_report_dir) / f"Report_{config.end_date}" / f"Trading_price_{config.end_date}.csv"
-    csv_path = Path('C:/Users/30211/vs_code/YIL_TR_AUTO/Report_20251128/Trading_price_20251128.csv')
+        # 리포트 일자/경로
+    config.end_date = last_report_day()
+    csv_path = Path(config.price_report_dir) / f"Auto_Trading_{config.end_date}.csv"
+    #csv_path = Path('C:/Users/30211/vs_code/YIL_TR_AUTO/Report_20251128/Trading_price_20251128.csv')
     
     if not csv_path.exists():
-        print(f"[ERROR] CSV 없음: {csv_path}");
-    
+        print(f"[ERROR] CSV 파일을 찾을 수 없습니다: {csv_path}")
+        return
 
-    # 1) DB 초기화
-    kis_pos_db.init_db()
+    print(f"[INFO] 포지션 DB 경로: {DB_PATH}")
+    init_db()
 
-    # 2) KIS API 연결 (환경변수 기반)
+    print("[INFO] KISAPI 초기화")
     kis = KISAPI.from_env()
 
-    # 3) 엔진 생성
-    engine = TradingEngine(kis)
+    # 1) CSV 시그널 로딩
+    signals = load_signals_from_csv(csv_path)
+    print(f"[INFO] CSV 시그널 {len(signals)}건 로딩 완료")
+    # 결과 출력
+    adjusted_signals = adjust_signals_based_on_trends(signals)
+    for signal in adjusted_signals:
+        print(f"종목: {signal['name']} ({signal['code']})")
+        print(f"매수가: {signal['entry']}, SL: {signal['sl']}, TP: {signal['tp']}")
+        print("---------")
 
-    # 4) 매수 후보 계획
-    signal_df = engine.load_signal_csv(csv_path)
-    plans = engine.plan_new_entries_from_csv(csv_path)
+    # 2) 신규 포지션 오픈
+    
+    open_new_positions_from_signals(kis, adjusted_signals)
+    # 3) OPEN 포지션 TP/SL/만기 체크 및 청산
+    process_open_positions(kis)
 
-    print(f"[INFO] Planned {len(plans)} BUY orders.")
-    for p in plans:
-        print(f" - {p.code} {p.name}, qty={p.qty}, entry={p.entry}")
 
-    # 5) 실제 주문 + DB 반영
-    engine.execute_order_plans(plans, signal_df)
-
-    print("[INFO] Morning batch done.")
-    print("※ TP/SL 관리를 위해서는 engine.check_tp_sl_and_close()를 "
-          "주기적으로 호출하는 루프/스케줄러를 별도로 구현해야 합니다.")
+if __name__ == "__main__":
+    main(sys.argv)
 
 

@@ -337,7 +337,96 @@ def get_position_by_id(pos_id: int, db_path: Path | str = DB_PATH) -> Optional[P
         return None
     return row_to_position(row)
 
+def get_positions_by_status(
+    statuses: List[str],
+    db_path: Path | str = DB_PATH
+) -> List[Position]:
+    """
+    status IN (...) 인 포지션 리스트 반환
+    """
+    if not statuses:
+        return []
 
+    conn = get_connection(db_path)
+    cur = conn.cursor()
+    placeholders = ",".join(["?"] * len(statuses))
+    cur.execute(
+        f"SELECT * FROM positions WHERE status IN ({placeholders}) ORDER BY open_time ASC",
+        tuple(statuses),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [row_to_position(r) for r in rows]
+
+
+def get_codes_by_status(
+    statuses: List[str],
+    db_path: Path | str = DB_PATH
+) -> List[str]:
+    """
+    status IN (...) 인 포지션들의 code 리스트 반환(중복 제거)
+    """
+    if not statuses:
+        return []
+
+    conn = get_connection(db_path)
+    cur = conn.cursor()
+    placeholders = ",".join(["?"] * len(statuses))
+    cur.execute(
+        f"SELECT DISTINCT code FROM positions WHERE status IN ({placeholders})",
+        tuple(statuses),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [str(r["code"]).zfill(6) for r in rows if r and r["code"]]
+
+
+def set_position_status(
+    pos_id: int,
+    new_status: str,
+    db_path: Path | str = DB_PATH
+) -> bool:
+    """
+    단일 포지션 status 변경. 성공 시 True.
+    """
+    conn = get_connection(db_path)
+    cur = conn.cursor()
+    cur.execute("UPDATE positions SET status=? WHERE id=?", (new_status, pos_id))
+    conn.commit()
+    ok = (cur.rowcount == 1)
+    conn.close()
+    return ok
+
+
+def update_position_fields(pos_id: int, fields: Dict[str, Any], db_path: Path | str = DB_PATH) -> bool:
+    """
+    positions 테이블의 특정 컬럼들을 업데이트하는 범용 함수.
+    예) update_position_fields(1, {"status":"OPEN", "entry":70100, "qty":10})
+    """
+    if not fields:
+        return False
+
+    allowed = {
+        "code", "name", "side", "qty", "entry", "tp", "sl",
+        "open_time", "close_time", "status",
+        "exit_price", "exit_reason",
+        "score_1w", "rr", "confidence", "horizon", "valid_until", "note"
+    }
+
+    bad = [k for k in fields.keys() if k not in allowed]
+    if bad:
+        raise ValueError(f"update_position_fields: 허용되지 않은 필드: {bad}")
+
+    set_clause = ", ".join([f"{k}=?" for k in fields.keys()])
+    params = list(fields.values()) + [pos_id]
+
+    conn = get_connection(db_path)
+    cur = conn.cursor()
+    cur.execute(f"UPDATE positions SET {set_clause} WHERE id=?", params)
+    conn.commit()
+    ok = (cur.rowcount == 1)
+    conn.close()
+    return ok
 # ============================================================
 # 비고 / 메모 수정
 # ============================================================
@@ -385,6 +474,7 @@ if __name__ == "__main__":
         horizon="h2",
         valid_until=None,
         note="테스트 포지션",
+        
     )
     pid = insert_position(demo)
     print(f"[INFO] inserted demo position id={pid}")
